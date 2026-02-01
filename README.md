@@ -302,7 +302,7 @@ not in the orchestration layer.
 
 If you understand this README, you understand the engine.
 
-## Licença
+## License
 
 This project is distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
