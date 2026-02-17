@@ -282,14 +282,14 @@ O motor não depende de um broker específico.
 
 | Recurso            | Garantia |
 | ------------------ | -------- |
-| Determinismo       | SIM      |
-| Idempotência       | SIM      |
-| Segurança de retry | SIM      |
-| Execução paralela  | SIM      |
-| Cancelamento       | SIM      |
-| Compensação        | SIM      |
-| Observabilidade    | SIM      |
-| Testabilidade      | SIM      |
+| Determinismo       | ✅      |
+| Idempotência       | ✅      |
+| Segurança de retry | ✅      |
+| Execução paralela  | ✅      |
+| Cancelamento       | ✅      |
+| Compensação        | ✅      |
+| Observabilidade    | ✅      |
+| Testabilidade      | ✅      |
 
 ---
 
