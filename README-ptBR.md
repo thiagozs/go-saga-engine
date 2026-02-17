@@ -308,4 +308,4 @@ Este projeto é distribuído sob a Licença MIT. Veja o arquivo [LICENSE](LICENS
 
 ## Autor
 
-2026, Thiago Zilli Sarmento <3
+2026, Thiago Zilli Sarmento :heart:
