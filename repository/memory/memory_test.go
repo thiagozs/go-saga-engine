@@ -117,3 +117,44 @@ func TestRepositoryEnforcesLeaseVersionAndAtomicOutbox(t *testing.T) {
 		t.Fatalf("old worker should not save after losing lease: %v", err)
 	}
 }
+
+func TestRepositoryRenewLease(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Now()
+	repo := NewWithClock(func() time.Time { return now })
+	saga := &state.State{SagaID: "saga-renew", ExecutedStages: make(map[string]bool)}
+	started := event.Envelope{
+		EventID: "event-1", Kind: event.KindNext, SagaID: saga.SagaID, CreatedAt: now,
+	}
+	if err := repo.Create(ctx, saga, started); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Renew(ctx, saga.SagaID, "worker-1", time.Minute); !errors.Is(err, repository.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost without lease, got %v", err)
+	}
+	if _, err := repo.Claim(ctx, saga.SagaID, "worker-1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Renew(ctx, saga.SagaID, "worker-2", time.Minute); !errors.Is(err, repository.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost for other owner, got %v", err)
+	}
+	now = now.Add(30 * time.Second)
+	if err := repo.Renew(ctx, saga.SagaID, "worker-1", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := repo.Claim(ctx, saga.SagaID, "worker-2", time.Minute); !errors.Is(err, repository.ErrLeaseHeld) {
+		t.Fatalf("expected renewed lease to block another worker, got %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	if err := repo.Renew(ctx, saga.SagaID, "worker-1", time.Minute); !errors.Is(err, repository.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost after expiry, got %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := repo.Renew(cancelled, saga.SagaID, "worker-1", time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
