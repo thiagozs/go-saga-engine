@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"reflect"
 	"sync"
 	"time"
 
@@ -24,31 +23,29 @@ import (
 
 type MemoryBus struct {
 	mu       sync.Mutex
-	handlers map[string][]func(context.Context, any)
+	handlers map[event.Kind][]func(context.Context, event.Envelope)
 }
 
 func NewMemoryBus() *MemoryBus {
 	return &MemoryBus{
-		handlers: make(map[string][]func(context.Context, any)),
+		handlers: make(map[event.Kind][]func(context.Context, event.Envelope)),
 	}
 }
 
-func (b *MemoryBus) Publish(evt any) {
+func (b *MemoryBus) Publish(_ context.Context, envelope event.Envelope) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	key := reflect.TypeOf(evt).String()
-	for _, h := range b.handlers[key] {
-		go h(context.Background(), evt)
+	handlers := append([]func(context.Context, event.Envelope){}, b.handlers[envelope.Kind]...)
+	b.mu.Unlock()
+	for _, handler := range handlers {
+		go handler(context.Background(), envelope)
 	}
+	return nil
 }
 
-func (b *MemoryBus) Subscribe(evt any, h func(context.Context, any)) {
+func (b *MemoryBus) Subscribe(kind event.Kind, handler func(context.Context, event.Envelope)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	key := reflect.TypeOf(evt).String()
-	b.handlers[key] = append(b.handlers[key], h)
+	b.handlers[kind] = append(b.handlers[kind], handler)
 }
 
 /*
@@ -105,7 +102,13 @@ func (s *SimpleStage) Execute(ctx context.Context, st *state.State) error {
 	s.exec++
 	slog.Info("executing stage", "stage", s.name, "attempt", s.exec)
 
-	time.Sleep(300 * time.Millisecond)
+	timer := time.NewTimer(300 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+	}
 
 	if s.failOnce && s.exec == 1 {
 		return errors.Retryable("temporary failure")
@@ -131,8 +134,13 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 
-	ctx := context.Background()
+	if err := run(context.Background(), log); err != nil {
+		log.Error("saga example failed", "error", err)
+		os.Exit(1)
+	}
+}
 
+func run(ctx context.Context, log *slog.Logger) error {
 	repo := memory.New()
 	bus := NewMemoryBus()
 	retry := NewRetryOnce()
@@ -170,33 +178,71 @@ func main() {
 	})
 
 	// engine saga
-	eng := engine.New("invoice-saga",
+	eng, err := engine.New("invoice-saga",
 		repo, bus, retry,
 		log, nodes...,
 	)
+	if err != nil {
+		return fmt.Errorf("create saga engine: %w", err)
+	}
+
+	completed := make(chan struct{})
+	var completeOnce sync.Once
+	markComplete := func() {
+		completeOnce.Do(func() { close(completed) })
+	}
+	handle := func(ctx context.Context, envelope event.Envelope) {
+		if err := eng.HandleNext(ctx, envelope.SagaID); err != nil {
+			slog.Error("handle saga event", "kind", envelope.Kind, "error", err)
+			markComplete()
+			return
+		}
+		current, err := repo.Get(ctx, envelope.SagaID)
+		if err != nil {
+			slog.Error("read saga after event", "kind", envelope.Kind, "error", err)
+			markComplete()
+			return
+		}
+		if current.Status == state.StatusCompleted || current.Status == state.StatusFailed {
+			markComplete()
+		}
+	}
 
 	// wiring do bus
-	bus.Subscribe(event.Next{}, func(ctx context.Context, evt any) {
-		eng.HandleNext(ctx, evt.(event.Next).SagaID)
-	})
+	bus.Subscribe(event.KindNext, handle)
 
-	bus.Subscribe(event.Retry{}, func(ctx context.Context, evt any) {
-		time.Sleep(300 * time.Millisecond)
-		eng.HandleNext(ctx, evt.(event.Retry).SagaID)
+	bus.Subscribe(event.KindRetry, func(ctx context.Context, envelope event.Envelope) {
+		timer := time.NewTimer(max(time.Duration(0), time.Until(envelope.NotBefore)))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			slog.Error("wait for saga retry", "error", ctx.Err())
+			markComplete()
+			return
+		case <-timer.C:
+		}
+		handle(ctx, envelope)
 	})
 
 	// start saga
 	saga, err := eng.Start(ctx, map[string]any{
-		"invoice_id": "INV-2025-01",
+		"invoice_id": "INV-2026-01",
 	})
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("start saga: %w", err)
 	}
 
-	// aguarda execução
-	time.Sleep(3 * time.Second)
+	// aguarda o fluxo assíncrono concluir, com um limite explícito
+	select {
+	case <-completed:
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("wait for saga %q: timeout", saga.SagaID)
+	}
 
-	final, _ := repo.Get(ctx, saga.SagaID)
+	final, err := repo.Get(ctx, saga.SagaID)
+	if err != nil {
+		return fmt.Errorf("load final saga state: %w", err)
+	}
 
 	fmt.Println("\n======================")
 	fmt.Println(" SAGA FINAL STATE")
@@ -215,4 +261,6 @@ func main() {
 			h.Message,
 		)
 	}
+
+	return nil
 }

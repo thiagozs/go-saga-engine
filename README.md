@@ -1,120 +1,115 @@
 # go-saga-engine
 
-Read in other languages: [Portugues (Brasil)](README-ptBR.md)
+Read in other languages: [Português (Brasil)](README-ptBR.md)
 
-A robust, deterministic and testable SAGA orchestration engine written in Go.
+A compact, domain-agnostic SAGA orchestration engine written in Go.
 
-This project provides a generic SAGA engine designed for distributed transactional workflows, with strong guarantees around:
+> **Development status:** blocks 1 through 4 are complete: deterministic DAG
+> execution, isolated parallel waves, persisted retries, optimistic concurrency,
+> renewable leases, a transactional outbox, resilience tests and hardened CI.
+> The repository is prepared for the `v0.2.0` release. Follow the
+> [update roadmap](ROADMAP.md) and [changelog](CHANGELOG.md).
 
-- ordered execution (DAG)
-- parallelism
-- retry policies
-- idempotency
-- compensation
-- cancellation
-- observability (history / inspector)
+The engine coordinates distributed transactional workflows without knowing
+their business rules. Typical use cases include invoices, settlements,
+chargebacks and onboarding flows.
 
-It is domain-agnostic and can be reused for invoices, settlements, chargebacks, onboarding flows, etc.
+Go 1.27.0 is the minimum supported version. CI continuously verifies the latest
+Go 1.27 patch release.
 
----
+## What the engine provides
 
-## What This Engine Is (and Is Not)
+- validated DAG-based execution;
+- stable topological ordering;
+- isolated execution of parallel stages;
+- deterministic payload merge;
+- context cancellation and optional stage timeouts;
+- reverse-order compensation;
+- persisted execution history;
+- pluggable repository, retry policy and event bus contracts.
 
-### This engine IS
+It is an orchestrator, not a BPMN engine, scheduler, cron system, message
+broker or domain framework.
 
-- A SAGA orchestrator
-- A distributed transaction coordinator
-- A deterministic workflow engine
-- A DAG-based execution engine
-- Safe for retries, restarts, and crashes
-- Designed for production-grade fintech / backend systems
+## Current guarantees and limitations
 
-### This engine IS NOT
+| Capability | Status |
+| ---------- | ------ |
+| DAG validation and stable topological order | Implemented |
+| Isolated parallel execution and deterministic merge | Implemented |
+| Reverse-order compensation after wave shutdown | Implemented |
+| Deep-copy in-memory repository | Implemented |
+| Durable retry limits, backoff, jitter and maximum delay | Implemented |
+| Renewable lease and optimistic concurrency | Implemented |
+| Transactional outbox and stalled-saga recovery | Implemented |
+| Resilience suite and CI race gate | Implemented |
 
-- A BPMN engine
-- A job scheduler
-- A cron system
-- A message broker
-- A domain framework
+Event delivery is at-least-once. Consumers must deduplicate by `EventID`, and
+stages remain responsible for making their external effects idempotent.
 
-The engine does not know your business logic.  
-It only guarantees execution semantics.
+## Core concepts
 
----
+### Saga state
 
-## Core Concepts
-
-### 1. Saga
-
-A Saga represents one distributed transaction.
-
-Each saga has:
-
-- a unique SagaID
-- a lifecycle (PENDING → RUNNING → COMPLETED | FAILED)
-- a shared mutable State
-- an execution history
-
----
-
-### 2. State
-
-The state.State is the single source of truth.
+`state.State` is the persisted source of truth:
 
 ```go
 type State struct {
-    SagaID         string
-    Name           string
-    Status         Status
-    Payload        map[string]any
+    SagaID          string
+    Name            string
+    Status          Status
+    CurrentStage    string
+    Version         uint64
+    Payload         map[string]any
 
-    ExecutedStages map[string]bool
-    History        []HistoryEntry
+    ExecutedStages  map[string]bool
+    CompletedStages []string
+    Attempts        map[string]int
+    History         []HistoryEntry
 
-    Error          *ErrorInfo
-    CreatedAt      time.Time
-    UpdatedAt      time.Time
+    Retry           *RetryInfo
+    Error           *ErrorInfo
+    CreatedAt       time.Time
+    UpdatedAt       time.Time
 }
 ```
 
-- Payload is the shared contract between stages
-- ExecutedStages ensures idempotency
-- History enables inspection, debugging and auditing
+- `Payload` is the business data exchanged by stages.
+- `ExecutedStages` tracks stages confirmed by the engine.
+- `CompletedStages` defines deterministic reverse compensation order.
+- `Attempts` and `Retry` persist retry scheduling per stage.
+- `Version` is used by repository compare-and-swap saves.
+- `History` records execution, failure and compensation events.
 
----
-
-### 3. Stage
-
-A Stage is one step of the saga.
+### Stages
 
 ```go
 type Stage interface {
     Name() string
-    Execute(ctx context.Context, state *state.State) error
-    Compensate(ctx context.Context, state *state.State) error
+    Execute(ctx context.Context, saga *state.State) error
+    Compensate(ctx context.Context, saga *state.State) error
 }
-```
 
-Optional timeout support:
-
-```go
 type TimedStage interface {
     Stage
     Timeout() time.Duration
 }
 ```
 
-Rules:
+`Execute` and `Compensate` must be idempotent with respect to their external
+effects. In a parallel wave, every stage receives an isolated state copy. The
+engine merges only payload changes back into its state; changes to lifecycle
+metadata are ignored.
 
-- Execute must be idempotent
-- Compensate must be best-effort
-- The engine never inspects the payload
+Payloads should be acyclic and use maps, slices, pointers or immutable values.
+Opaque values with private mutable state are copied by value and must be treated
+as immutable by parallel stages.
 
----
+Parallel stages may change different payload keys or write the same value to a
+shared key. Different writes to the same key produce `ErrPayloadConflict` and
+fail the saga rather than creating a nondeterministic result.
 
-### 4. DAG (Directed Acyclic Graph)
-
-Execution order is defined using Nodes:
+### DAG nodes
 
 ```go
 type Node struct {
@@ -124,23 +119,66 @@ type Node struct {
 }
 ```
 
-Example:
+Construction rejects:
 
-``` text
-A
-├── B (parallel)
-└── C (parallel)
-      │
-      └── D
+- an empty graph;
+- nil stages or empty stage names;
+- duplicate stage names;
+- unknown or repeated dependencies;
+- dependency cycles.
+
+Ready nodes follow a stable topological order derived from declaration order.
+A non-parallel node runs alone. Consecutive ready nodes marked `Parallel` run
+as one wave.
+
+## Creating and running an engine
+
+The constructor validates configuration and the complete DAG:
+
+```go
+eng, err := engine.New(
+    "invoice-saga",
+    repo,
+    bus,
+    retryPolicy,
+    logger,
+    nodes...,
+)
+if err != nil {
+    return err
+}
+
+saga, err := eng.Start(ctx, map[string]any{"invoice_id": "INV-2026-01"})
+if err != nil {
+    return err
+}
+
+if err := eng.HandleNext(ctx, saga.SagaID); err != nil {
+    return err
+}
 ```
 
-Dependencies are strictly enforced.
+`New` now returns `(*engine.Engine, error)` and `HandleNext` returns operational
+or terminal execution errors. Existing users should follow the
+[`v0.2.0` migration guide](MIGRATION.md).
 
----
+## Execution semantics
 
-## Retry Semantics
+For every execution wave, the engine:
 
-Retry behavior is fully pluggable:
+1. finds ready nodes in stable topological order;
+2. records `EXECUTING` in that same order;
+3. gives each stage an isolated state copy;
+4. cancels the wave context when a stage fails;
+5. waits for every started stage to return;
+6. commits successful stages and merges their payload changes deterministically;
+7. persists the resulting state before continuing.
+
+A parallel stage that finishes successfully before a peer fails is confirmed
+and included in compensation. This avoids leaving a successful external effect
+untracked.
+
+## Durable retry semantics
 
 ```go
 type Policy interface {
@@ -149,163 +187,111 @@ type Policy interface {
 }
 ```
 
-- Only retryable errors should be retried
-- Retry attempts are tracked per stage
-- Retry is triggered via an event (event.Retry)
+On failure, the engine increments the stage attempt before consulting the
+policy. The exponential policy enforces `MaxAttempts`, doubles from `BaseDelay`,
+caps at `MaxDelay` and optionally applies jitter. The resulting `RetryInfo` and
+retry outbox event are committed atomically before publication.
 
----
+Retry events carry `Attempt` and `NotBefore`. Consumers must not invoke the
+engine before `NotBefore`; an early call returns `ErrRetryNotReady` without
+executing a stage.
 
-## Compensation Semantics
+## Concurrency and crash recovery
 
-Compensation is executed when a fatal failure occurs:
+`HandleNext` claims a renewable lease for its `SagaID`. Another worker receives
+`repository.ErrLeaseHeld` and cannot start stages for that saga. Every save uses
+the state `Version` as a compare-and-swap condition, producing
+`repository.ErrVersionConflict` for stale state.
 
-- Only stages marked as ExecutedStages == true are compensated
-- Compensation runs in reverse logical order
-- Compensation is best-effort, not transactional
+`RecoverStalled(ctx, updatedBefore, limit)` creates durable `Next` events for
+`RUNNING` sagas whose lease expired and whose state was not updated after the
+cutoff. Stages still need idempotent external effects because a process can
+crash after an external side effect and before saving its result.
 
----
+Applications should call `RecoverStalled` periodically from a single scheduled
+maintenance job; it is intentionally not an internal goroutine.
 
-## Cancellation Semantics (IMPORTANT)
+## Compensation semantics
 
-This engine uses context cancellation to stop execution.
+On a terminal failure:
 
-### What is guaranteed
+- all stages in the current wave are allowed to stop first;
+- every confirmed stage is compensated in reverse `CompletedStages` order;
+- compensation remains best-effort;
+- a successful compensation records `COMPENSATED`;
+- a failed compensation records `COMPENSATION_FAILED` and its error is returned;
+- the saga ends as `FAILED` and emits `event.KindDeadLetter`.
 
-- No new stages will start after a fatal failure
-- All running stages receive ctx.Done()
-- Saga ends in FAILED state
-- Compensation is executed
-- DeadLetter event is emitted
+## Cancellation semantics
 
-### What is NOT guaranteed (by design)
+Go cancellation is cooperative, not preemptive. Once one stage fails, every
+other running stage receives `ctx.Done()`, but it may still finish. No new wave
+starts after the failure.
 
-- A parallel stage that already started may run briefly
-- Cancellation is not preemptive in Go
+Stages should regularly observe the context and avoid starting irreversible
+work after it is canceled.
 
-Key rule:  
-A stage may start, but it must not be marked as EXECUTED if a fatal failure occurs.
+## Event bus integration
 
----
+Events are persisted as `event.Envelope` values containing `EventID`, `Kind`,
+`SagaID`, stage, attempt and scheduling timestamps. The engine emits:
 
-## Saga Inspector (History)
+- `event.KindNext` when a saga is created;
+- `event.KindRetry` when a failure is accepted by the retry policy;
+- `event.KindDeadLetter` after a terminal failure is persisted.
 
-Every meaningful event is recorded:
-
-``` text
-EXECUTING
-EXECUTED
-FAILED
-COMPENSATED
-COMPLETED
+```go
+type EventBus interface {
+    Publish(ctx context.Context, envelope event.Envelope) error
+}
 ```
 
-Example history output:
+State changes and new envelopes are committed atomically by the repository.
+`DispatchPending` publishes the outbox using a context-aware `EventBus` and only
+then marks events as published. A crash between those operations can duplicate
+delivery, so consumers must deduplicate by `EventID`.
 
-``` text
-2026-02-01T17:18:29 | identify-client        | EXECUTED
-2026-02-01T17:18:30 | generate-bank-invoice | FAILED
-2026-02-01T17:18:30 | identify-client        | COMPENSATED
-2026-02-01T17:18:31 | SAGA                   | FAILED
+RabbitMQ, Kafka, NATS or an in-memory implementation can provide the small
+`EventBus` contract.
+
+## Examples
+
+- [`examples/simple`](examples/simple) demonstrates the basic engine API and a
+  retryable stage.
+- [`examples/order-fulfillment`](examples/order-fulfillment) models order
+  validation, parallel fraud and inventory checks, payment, shipping retry,
+  customer notification and reverse compensation after payment rejection.
+
+## Verification
+
+The current block is verified with:
+
+```text
+go test ./...
+go test -race -count=20 ./...
+go vet ./...
+golangci-lint run ./...
+govulncheck ./...
 ```
 
-This enables:
+Tests cover invalid graphs, stable ordering, isolated payload merging,
+conflicting writes, reverse compensation, repository copies, retry limits and
+timing, outbox recovery, leases, version conflicts, timeout, cancellation,
+persisted-wave restarts and stalled-saga scheduling. CI repeats the suite under
+the race detector, and the DAG validator also has a fuzz target.
 
-- debugging
-- auditing
-- UI inspectors
-- support tooling
+## Versioning
 
----
-
-## Testing Philosophy
-
-The engine is designed to be fully testable.
-
-Provided tools:
-
-- repository/memory for fast tests
-- pluggable EventBus
-- deterministic execution
-- concurrency-safe design
-
-Important testing rule:
-
-Do NOT test:
-
-``` text
-"stage X should never start"
-```
-
-Instead, test:
-
-``` text
-"stage X must not be marked as EXECUTED"
-```
-
-This aligns with real-world concurrency guarantees.
-
----
-
-## Event Bus Integration
-
-The engine is event-driven.
-
-Required events:
-
-- event.Next
-- event.Retry
-- event.DeadLetter
-
-You can plug:
-
-- in-memory bus
-- RabbitMQ
-- Kafka
-- NATS
-
-The engine does not depend on a specific broker.
-
----
-
-## Example Use Cases
-
-- Invoice generation
-- Monthly financial closing
-- Settlement pipelines
-- Onboarding workflows
-- Chargeback lifecycles
-- Token minting / burning flows
-
----
-
-## Design Guarantees
-
-| Feature            | Guarantee |
-| ------------------ | --------- |
-| Determinism        | ✅        |
-| Idempotency        | ✅        |
-| Retry safety       | ✅        |
-| Parallel execution | ✅        |
-| Cancellation       | ✅        |
-| Compensation       | ✅        |
-| Observability      | ✅        |
-| Testability        | ✅        |
-
----
-
-## Final Note
-
-This engine is intentionally small, explicit and strict.
-
-Complexity lives in your domain,  
-not in the orchestration layer.
-
-If you understand this README, you understand the engine.
+The project follows Semantic Versioning. Before `v1.0.0`, incompatible public
+API changes increment the minor version. Starting with `v1.0.0`, incompatible
+changes increment the major version; compatible features increment the minor
+version and fixes increment the patch version. Releases and upgrade notes are
+recorded in the [changelog](CHANGELOG.md).
 
 ## License
 
-This project is distributed under the MIT License. See the [LICENSE](LICENSE) file for details.
+Distributed under the MIT License. See [LICENSE](LICENSE).
 
-## Autor
+## Author
 
 2026, Thiago Zilli Sarmento :heart:
