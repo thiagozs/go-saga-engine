@@ -140,8 +140,13 @@ func TestRepositoryRenewLease(t *testing.T) {
 	if err := repo.Renew(ctx, saga.SagaID, "worker-2", time.Minute); !errors.Is(err, repository.ErrLeaseLost) {
 		t.Fatalf("expected ErrLeaseLost for other owner, got %v", err)
 	}
+	now = now.Add(30 * time.Second)
 	if err := repo.Renew(ctx, saga.SagaID, "worker-1", time.Minute); err != nil {
 		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := repo.Claim(ctx, saga.SagaID, "worker-2", time.Minute); !errors.Is(err, repository.ErrLeaseHeld) {
+		t.Fatalf("expected renewed lease to block another worker, got %v", err)
 	}
 	now = now.Add(2 * time.Minute)
 	if err := repo.Renew(ctx, saga.SagaID, "worker-1", time.Minute); !errors.Is(err, repository.ErrLeaseLost) {
