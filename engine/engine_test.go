@@ -1050,3 +1050,68 @@ func TestRestartDoesNotRepeatPersistedWave(t *testing.T) {
 		t.Fatalf("persisted wave was repeated: A=%d B=%d", stageAExecutions, stageBExecutions)
 	}
 }
+
+type failureCompensatingStage struct{ *FuncStage }
+
+func (failureCompensatingStage) CompensateOnFailure() bool { return true }
+
+func TestCompensatesFailedStageWhenOptedIn(t *testing.T) {
+	ctx := context.Background()
+	var order []string
+	mk := func(name string, fail bool) *FuncStage {
+		return &FuncStage{
+			name: name,
+			execute: func(context.Context, *state.State) error {
+				if fail {
+					return stderrors.New("boom")
+				}
+				return nil
+			},
+			compensate: func(context.Context, *state.State) error {
+				order = append(order, name)
+				return nil
+			},
+		}
+	}
+	eng, err := New("s", memory.New(), NewMemoryBus(), &NeverRetry{}, slog.Default(),
+		Node{Stage: mk("A", false)},
+		Node{Stage: failureCompensatingStage{mk("B", true)}, DependsOn: []string{"A"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saga, err := eng.Start(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.HandleNext(ctx, saga.SagaID); err == nil {
+		t.Fatal("expected failure")
+	}
+	if !slices.Equal(order, []string{"B", "A"}) {
+		t.Fatalf("compensation order = %v, want [B A]", order)
+	}
+}
+
+func TestStartWithIDIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	eng, err := New("s", repo, NewMemoryBus(), &NeverRetry{}, slog.Default(),
+		Node{Stage: &FuncStage{name: "A"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := eng.StartWithID(ctx, "order-42", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := eng.StartWithID(ctx, "order-42", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SagaID != "order-42" || second.SagaID != "order-42" {
+		t.Fatalf("unexpected ids %q %q", first.SagaID, second.SagaID)
+	}
+	if _, err := eng.StartWithID(ctx, "", nil); !stderrors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig, got %v", err)
+	}
+}

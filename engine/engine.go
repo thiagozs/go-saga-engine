@@ -127,9 +127,18 @@ func NewWithConfig(config Config, nodes ...Node) (*Engine, error) {
 }
 
 func (e *Engine) Start(ctx context.Context, payload map[string]any) (*state.State, error) {
+	return e.StartWithID(ctx, uuid.NewString(), payload)
+}
+
+// StartWithID is Start with a caller-supplied saga ID acting as idempotency
+// key. If a saga with that ID already exists it is returned unchanged.
+func (e *Engine) StartWithID(ctx context.Context, sagaID string, payload map[string]any) (*state.State, error) {
+	if sagaID == "" {
+		return nil, fmt.Errorf("%w: saga id is required", ErrInvalidConfig)
+	}
 	now := e.clock.Now()
 	s := &state.State{
-		SagaID:         uuid.NewString(),
+		SagaID:         sagaID,
 		Name:           e.name,
 		Status:         state.StatusPending,
 		Payload:        state.ClonePayload(payload),
@@ -142,6 +151,13 @@ func (e *Engine) Start(ctx context.Context, payload map[string]any) (*state.Stat
 
 	nextEvent := e.newEvent(event.KindNext, s.SagaID, "", 0, time.Time{})
 	if err := e.repo.Create(ctx, s, nextEvent); err != nil {
+		if stderrors.Is(err, repository.ErrAlreadyExists) {
+			existing, getErr := e.repo.Get(ctx, sagaID)
+			if getErr != nil {
+				return nil, fmt.Errorf("load existing saga %q: %w", sagaID, getErr)
+			}
+			return existing, nil
+		}
 		return nil, fmt.Errorf("create saga: %w", err)
 	}
 	if err := e.DispatchPending(ctx, 100); err != nil {
@@ -359,7 +375,7 @@ func (e *Engine) fail(
 		return nil
 	}
 
-	compensationErr := e.compensate(ctx, s)
+	compensationErr := e.compensate(ctx, s, failedStage)
 	s.Status = state.StatusFailed
 	s.Error = &state.ErrorInfo{Stage: failedStage, Message: cause.Error()}
 	s.UpdatedAt = e.clock.Now()
@@ -505,13 +521,21 @@ func (e *Engine) keepLease(
 	}
 }
 
-func (e *Engine) compensate(ctx context.Context, s *state.State) error {
+func (e *Engine) compensate(ctx context.Context, s *state.State, failedStage string) error {
 	completed := slices.Clone(s.CompletedStages)
 	if len(completed) == 0 {
 		for _, node := range e.nodes {
 			if s.ExecutedStages[node.Stage.Name()] {
 				completed = append(completed, node.Stage.Name())
 			}
+		}
+	}
+
+	// A failed stage may have produced partial effects; stages that opt in via
+	// stage.FailureCompensator are compensated first (best effort, idempotent).
+	if node, ok := e.index[failedStage]; ok && !s.ExecutedStages[failedStage] {
+		if fc, ok := node.Stage.(stage.FailureCompensator); ok && fc.CompensateOnFailure() {
+			completed = append(completed, failedStage)
 		}
 	}
 
