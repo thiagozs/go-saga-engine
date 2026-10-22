@@ -1115,3 +1115,43 @@ func TestStartWithIDIsIdempotent(t *testing.T) {
 		t.Fatalf("expected ErrInvalidConfig, got %v", err)
 	}
 }
+
+func TestCompensationFailureIsReportedAndNotRecordedAsCompensated(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	compErr := stderrors.New("refund unavailable")
+	eng, err := New("s", repo, NewMemoryBus(), &NeverRetry{}, slog.Default(),
+		Node{Stage: &FuncStage{
+			name:       "A",
+			compensate: func(context.Context, *state.State) error { return compErr },
+		}},
+		Node{Stage: &FuncStage{
+			name:    "B",
+			execute: func(context.Context, *state.State) error { return stderrors.New("boom") },
+		}, DependsOn: []string{"A"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saga, err := eng.Start(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = eng.HandleNext(ctx, saga.SagaID)
+	if !stderrors.Is(err, compErr) {
+		t.Fatalf("expected compensation error in result, got %v", err)
+	}
+	final, _ := repo.Get(ctx, saga.SagaID)
+	var failed, compensated bool
+	for _, h := range final.History {
+		if h.Stage == "A" && h.Status == "COMPENSATION_FAILED" {
+			failed = true
+		}
+		if h.Stage == "A" && h.Status == "COMPENSATED" {
+			compensated = true
+		}
+	}
+	if !failed || compensated {
+		t.Fatalf("history must show COMPENSATION_FAILED only: %+v", final.History)
+	}
+}
