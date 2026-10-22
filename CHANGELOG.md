@@ -3,7 +3,7 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - 2026-10-22
+## [0.2.1] - 2026-10-22
 
 ### Added
 
@@ -38,6 +38,6 @@ All notable changes are documented here. This project follows
 - implicit event subscriptions from the engine. Applications now dispatch
   durable outbox events to their own consumers.
 
-[1.1.0]: https://github.com/thiagozs/go-saga-engine/releases/tag/v1.1.0
+[0.2.1]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.1
 [0.2.0]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.0
 
