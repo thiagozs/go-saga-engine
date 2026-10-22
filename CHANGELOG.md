@@ -3,7 +3,16 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] - Unreleased
+## [1.1.0] - 2026-10-22
+
+### Added
+
+- `Engine.StartWithID`, which uses a caller-supplied saga ID as idempotency key
+  and returns the existing saga when it was already started;
+- `stage.FailureCompensator`: stages that opt in are compensated first when
+  their own `Execute` fails, covering partial effects.
+
+## [0.2.0] - 2026-10-15
 
 ### Added
 
@@ -29,5 +38,6 @@ All notable changes are documented here. This project follows
 - implicit event subscriptions from the engine. Applications now dispatch
   durable outbox events to their own consumers.
 
+[1.1.0]: https://github.com/thiagozs/go-saga-engine/releases/tag/v1.1.0
 [0.2.0]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.0
 
