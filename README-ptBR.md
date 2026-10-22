@@ -7,7 +7,7 @@ Um motor de orquestração SAGA compacto e agnóstico de domínio, escrito em Go
 > **Estado do desenvolvimento:** os blocos 1 a 4 estão concluídos: DAG
 > determinístico, waves paralelas isoladas, retries persistidos, concorrência
 > otimista, leases renováveis, outbox transacional, testes de resiliência e CI
-> fortalecido. O repositório está preparado para a versão `v0.2.0`. Acompanhe o
+> fortalecido. O repositório está com a versão mais recente `v0.2.1`. Acompanhe o
 > [plano de atualização](ROADMAP.md) e o [changelog](CHANGELOG.md).
 
 O motor coordena workflows transacionais distribuídos sem conhecer suas regras
@@ -24,7 +24,8 @@ patch mais recente do Go 1.27.
 - execução isolada de stages paralelos;
 - merge determinístico do payload;
 - cancelamento por contexto e timeout opcional por stage;
-- compensação em ordem reversa;
+- compensação em ordem reversa, opcionalmente incluindo o stage que falhou;
+- início idempotente de saga por meio de um ID informado pelo chamador;
 - histórico persistido da execução;
 - contratos plugáveis para repositório, retry e event bus.
 
@@ -94,6 +95,11 @@ type TimedStage interface {
     Stage
     Timeout() time.Duration
 }
+
+type FailureCompensator interface {
+    Stage
+    CompensateOnFailure() bool
+}
 ```
 
 `Execute` e `Compensate` devem ser idempotentes em relação a seus efeitos
@@ -158,6 +164,14 @@ if err := eng.HandleNext(ctx, saga.SagaID); err != nil {
 }
 ```
 
+Use `StartWithID` para tornar o início idempotente. O ID da saga funciona como
+chave de idempotência: iniciar o mesmo ID de novo retorna a saga existente, sem
+criar outra nem alterá-la.
+
+```go
+saga, err := eng.StartWithID(ctx, "onboarding-cliente-42", payload)
+```
+
 `New` agora retorna `(*engine.Engine, error)` e `HandleNext` retorna erros
 operacionais ou terminais de execução. Usuários existentes devem seguir o
 [guia de migração para `v0.2.0`](MIGRATION.md).
@@ -216,6 +230,10 @@ Em uma falha terminal:
 
 - todos os stages da wave atual param antes da compensação;
 - os stages confirmados são compensados na ordem reversa de `CompletedStages`;
+- um stage que implementa `stage.FailureCompensator` e retorna `true` em
+  `CompensateOnFailure()` é compensado primeiro quando seu próprio `Execute`
+  falha, pois pode ter deixado efeitos parciais (seu `Compensate` deve ser
+  idempotente e seguro para um stage que não concluiu);
 - a compensação continua sendo best-effort;
 - sucesso registra `COMPENSATED`;
 - falha registra `COMPENSATION_FAILED` e seu erro é retornado;
@@ -257,6 +275,8 @@ pequeno de `EventBus`.
 
 - [`examples/simple`](examples/simple) demonstra a API básica do motor e um
   stage com retry.
+- [`examples/idempotent-start`](examples/idempotent-start) mostra o
+  `StartWithID` impedindo que um pedido duplicado crie uma segunda saga.
 - [`examples/order-fulfillment`](examples/order-fulfillment) simula validação
   do pedido, antifraude e estoque em paralelo, pagamento, retry da entrega,
   notificação do cliente e compensação reversa após rejeição do pagamento.

@@ -7,7 +7,7 @@ A compact, domain-agnostic SAGA orchestration engine written in Go.
 > **Development status:** blocks 1 through 4 are complete: deterministic DAG
 > execution, isolated parallel waves, persisted retries, optimistic concurrency,
 > renewable leases, a transactional outbox, resilience tests and hardened CI.
-> The repository is prepared for the `v0.2.0` release. Follow the
+> The latest release is `v0.2.1`. Follow the
 > [update roadmap](ROADMAP.md) and [changelog](CHANGELOG.md).
 
 The engine coordinates distributed transactional workflows without knowing
@@ -24,7 +24,8 @@ Go 1.27 patch release.
 - isolated execution of parallel stages;
 - deterministic payload merge;
 - context cancellation and optional stage timeouts;
-- reverse-order compensation;
+- reverse-order compensation, optionally including the stage that failed;
+- idempotent saga start through a caller-supplied saga ID;
 - persisted execution history;
 - pluggable repository, retry policy and event bus contracts.
 
@@ -94,6 +95,11 @@ type TimedStage interface {
     Stage
     Timeout() time.Duration
 }
+
+type FailureCompensator interface {
+    Stage
+    CompensateOnFailure() bool
+}
 ```
 
 `Execute` and `Compensate` must be idempotent with respect to their external
@@ -158,6 +164,14 @@ if err := eng.HandleNext(ctx, saga.SagaID); err != nil {
 }
 ```
 
+Use `StartWithID` to make starts idempotent. The saga ID acts as the
+idempotency key: starting the same ID again returns the existing saga without
+creating a new one or changing it.
+
+```go
+saga, err := eng.StartWithID(ctx, "onboarding-customer-42", payload)
+```
+
 `New` now returns `(*engine.Engine, error)` and `HandleNext` returns operational
 or terminal execution errors. Existing users should follow the
 [`v0.2.0` migration guide](MIGRATION.md).
@@ -217,6 +231,10 @@ On a terminal failure:
 
 - all stages in the current wave are allowed to stop first;
 - every confirmed stage is compensated in reverse `CompletedStages` order;
+- a stage that implements `stage.FailureCompensator` and returns `true` from
+  `CompensateOnFailure()` is compensated first when its own `Execute` fails,
+  because it may have left partial effects (its `Compensate` must be idempotent
+  and safe to call on a stage that never completed);
 - compensation remains best-effort;
 - a successful compensation records `COMPENSATED`;
 - a failed compensation records `COMPENSATION_FAILED` and its error is returned;
@@ -258,6 +276,8 @@ RabbitMQ, Kafka, NATS or an in-memory implementation can provide the small
 
 - [`examples/simple`](examples/simple) demonstrates the basic engine API and a
   retryable stage.
+- [`examples/idempotent-start`](examples/idempotent-start) shows `StartWithID`
+  preventing a duplicated request from creating a second saga.
 - [`examples/order-fulfillment`](examples/order-fulfillment) models order
   validation, parallel fraud and inventory checks, payment, shipping retry,
   customer notification and reverse compensation after payment rejection.
