@@ -3,6 +3,17 @@
 All notable changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-10-22
+
+### Added
+
+- `examples/idempotent-start`, demonstrating `Engine.StartWithID`.
+
+### Changed
+
+- README and README-ptBR now document `StartWithID` and
+  `stage.FailureCompensator`.
+
 ## [0.2.1] - 2026-10-22
 
 ### Added
@@ -38,6 +49,7 @@ All notable changes are documented here. This project follows
 - implicit event subscriptions from the engine. Applications now dispatch
   durable outbox events to their own consumers.
 
+[0.2.2]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.2
 [0.2.1]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.1
 [0.2.0]: https://github.com/thiagozs/go-saga-engine/releases/tag/v0.2.0
 
